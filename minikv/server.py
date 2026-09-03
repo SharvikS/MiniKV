@@ -12,7 +12,7 @@ Module 2 fixes that the simplest way that actually works: hand each accepted
 connection to its own thread and get straight back to accept(). The threads
 block independently, so one slow client can no longer starve the others.
 
-Run:   python3 server.py
+Run:   python3 -m minikv.server
 Test:  open three clients at once - all three get echoed independently.
 """
 
@@ -167,7 +167,7 @@ def main() -> None:
     #                so ourselves, which is what the RESP protocol is for.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         # Without SO_REUSEADDR the port lingers in TIME_WAIT for up to a minute
-        # after we exit, and the next `python3 server.py` dies with
+        # after we exit, and the next `python3 -m minikv.server` dies with
         # "Address already in use". This makes restarts instant.
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
