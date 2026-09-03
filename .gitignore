@@ -1,3 +1,11 @@
-.zig-cache/
-zig-out/
-*.o
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# MiniKV data files (snapshots and append-only logs, added in Modules 6-7)
+*.rdb
+*.aof
