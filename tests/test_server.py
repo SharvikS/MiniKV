@@ -1,7 +1,8 @@
 r"""
-Unit tests for minikv.server (Module 3).
+Unit tests for minikv.server (Modules 3-4).
 
 Created: 2026-09-04 (Module 3)
+Updated: 2026-09-04 (Module 4 - the keyspace commands)
 
 Two layers, tested two ways.
 
@@ -27,6 +28,14 @@ from minikv import protocol, server
 
 class TestDispatch(unittest.TestCase):
     """The command table, exercised without a socket in sight."""
+
+    def setUp(self):
+        # server.STORE is module-level state shared by every client thread, so
+        # it is also shared by every test. Wiping it before each one keeps the
+        # suite order-independent - otherwise a test passes alone and fails in
+        # a full run, which is the worst kind of failure to chase.
+        server.STORE.clear()
+        self.addCleanup(server.STORE.clear)
 
     def test_ping(self):
         self.assertEqual(server.dispatch([b"PING"]), (b"+PONG\r\n", False))
@@ -85,6 +94,83 @@ class TestDispatch(unittest.TestCase):
         self.assertIn(b"...", reply)
 
 
+class TestKeyspaceCommands(unittest.TestCase):
+    """SET/GET/DEL/EXISTS as the client sees them, replies and all."""
+
+    def setUp(self):
+        server.STORE.clear()
+        self.addCleanup(server.STORE.clear)
+
+    def reply(self, *command: bytes) -> bytes:
+        return server.dispatch(list(command))[0]
+
+    def test_set_then_get(self):
+        self.assertEqual(self.reply(b"SET", b"name", b"minikv"), protocol.OK)
+        self.assertEqual(self.reply(b"GET", b"name"), b"$6\r\nminikv\r\n")
+
+    def test_get_missing_key_is_nil_not_an_error(self):
+        self.assertEqual(self.reply(b"GET", b"nope"), protocol.NULL_BULK_STRING)
+
+    def test_get_empty_value_is_not_nil(self):
+        self.reply(b"SET", b"k", b"")
+        self.assertEqual(self.reply(b"GET", b"k"), b"$0\r\n\r\n")
+
+    def test_values_are_binary_safe_end_to_end(self):
+        payload = b"\x00\r\n\xff"
+        self.reply(b"SET", b"k", payload)
+        self.assertEqual(self.reply(b"GET", b"k"), protocol.bulk_string(payload))
+
+    def test_keys_are_case_sensitive_even_though_commands_are_not(self):
+        # `set` and `SET` are the same command; `key` and `KEY` are not the
+        # same key. Normalising the command name must not touch the arguments.
+        self.reply(b"set", b"Key", b"upper")
+        self.reply(b"SET", b"key", b"lower")
+        self.assertEqual(self.reply(b"GET", b"Key"), b"$5\r\nupper\r\n")
+        self.assertEqual(self.reply(b"GET", b"key"), b"$5\r\nlower\r\n")
+
+    def test_set_nx_declines_with_nil(self):
+        self.assertEqual(self.reply(b"SET", b"k", b"first", b"NX"), protocol.OK)
+        # nil, not +OK: a client using SET NX as a lock has to be able to tell
+        # "I stored it" from "someone else already had it".
+        self.assertEqual(self.reply(b"SET", b"k", b"second", b"NX"), protocol.NULL_BULK_STRING)
+        self.assertEqual(self.reply(b"GET", b"k"), b"$5\r\nfirst\r\n")
+
+    def test_set_xx_declines_a_missing_key(self):
+        self.assertEqual(self.reply(b"SET", b"k", b"v", b"xx"), protocol.NULL_BULK_STRING)
+        self.reply(b"SET", b"k", b"first")
+        self.assertEqual(self.reply(b"SET", b"k", b"second", b"XX"), protocol.OK)
+
+    def test_set_syntax_errors(self):
+        for command in ((b"SET", b"k", b"v", b"NX", b"XX"), (b"SET", b"k", b"v", b"EX", b"5")):
+            with self.subTest(command=command):
+                # EX is a real Redis option MiniKV does not implement yet.
+                # Rejecting it beats silently ignoring it and never expiring
+                # a key the client believes is temporary.
+                self.assertEqual(self.reply(*command), b"-ERR syntax error\r\n")
+
+    def test_del_reports_how_many_existed(self):
+        self.reply(b"SET", b"a", b"1")
+        self.assertEqual(self.reply(b"DEL", b"a", b"missing"), b":1\r\n")
+        self.assertEqual(self.reply(b"GET", b"a"), protocol.NULL_BULK_STRING)
+
+    def test_exists_counts_duplicates(self):
+        self.reply(b"SET", b"a", b"1")
+        self.assertEqual(self.reply(b"EXISTS", b"a", b"a", b"b"), b":2\r\n")
+
+    def test_dbsize_and_flushall(self):
+        self.reply(b"SET", b"a", b"1")
+        self.reply(b"SET", b"b", b"2")
+        self.assertEqual(self.reply(b"DBSIZE"), b":2\r\n")
+        self.assertEqual(self.reply(b"FLUSHALL"), protocol.OK)
+        self.assertEqual(self.reply(b"DBSIZE"), b":0\r\n")
+
+    def test_arity_errors(self):
+        for command in ((b"SET", b"k"), (b"GET",), (b"GET", b"a", b"b"),
+                        (b"DEL",), (b"EXISTS",), (b"DBSIZE", b"x"), (b"FLUSHALL", b"x")):
+            with self.subTest(command=command):
+                self.assertTrue(self.reply(*command).startswith(b"-ERR wrong number of arguments"))
+
+
 def tcp_pair() -> tuple[socket.socket, socket.socket]:
     """A connected (client, server) pair over real TCP on the loopback.
 
@@ -114,6 +200,8 @@ class TestConnection(unittest.TestCase):
         patcher = mock.patch.object(server, "log")
         self.addCleanup(patcher.stop)
         patcher.start()
+        server.STORE.clear()
+        self.addCleanup(server.STORE.clear)
 
     def converse(self, *chunks: bytes) -> bytes:
         """Send chunks, half-close, and read everything the server replies.
@@ -174,6 +262,19 @@ class TestConnection(unittest.TestCase):
         # The commands pipelined behind QUIT are deliberately not answered.
         replies = self.converse(b"*1\r\n$4\r\nQUIT\r\n*1\r\n$4\r\nPING\r\n")
         self.assertEqual(replies, b"+OK\r\n")
+
+    def test_the_store_is_shared_between_connections(self):
+        # The reason STORE is module-level and the reason it needs a lock: what
+        # one connection writes, a later, separate connection reads.
+        self.assertEqual(self.converse(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nhi\r\n"), protocol.OK)
+        self.assertEqual(self.converse(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"), b"$2\r\nhi\r\n")
+
+    def test_inline_set_and_get_in_one_batch(self):
+        # What a person typing into netcat gets, pipelined into one packet.
+        self.assertEqual(
+            self.converse(b"SET a 1\r\nGET a\r\nDEL a\r\nGET a\r\n"),
+            b"+OK\r\n$1\r\n1\r\n:1\r\n$-1\r\n",
+        )
 
     def test_protocol_error_is_reported_and_the_connection_dropped(self):
         # A framing error is different in kind: there is no way to find the next
