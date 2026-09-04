@@ -1,23 +1,35 @@
 """
-MiniKV - Module 2: Concurrent TCP Server
+MiniKV - Module 3: Speaking RESP
 
 Created: 2026-09-04 (Module 1 - bare echo server)
 Updated: 2026-09-04 (Module 2 - one OS thread per connection)
+Updated: 2026-09-04 (Module 3 - RESP framing and a command table)
 
-Module 1 could only ever talk to one client. The accept loop called
-handle_client() directly, so it sat inside that client's recv() until they
-hung up; anyone else who connected got queued by the kernel and ignored.
+Modules 1 and 2 echoed bytes. That was the point: get a socket open, get many
+clients served, and prove we are moving bytes rather than strings. But an echo
+server never has to answer the only question TCP refuses to answer for us -
+where does one command end and the next begin?
 
-Module 2 fixes that the simplest way that actually works: hand each accepted
-connection to its own thread and get straight back to accept(). The threads
-block independently, so one slow client can no longer starve the others.
+Module 3 answers it. Bytes off the wire go into a RESPParser (minikv/protocol.py)
+that hands back whole commands and quietly keeps any half-command until the rest
+arrives; whole commands go into dispatch(), which looks them up in a table and
+returns encoded bytes. The store itself is still missing - GET and SET arrive in
+Module 4 - so the vocabulary here is small on purpose. What matters is that the
+shape is now right: read, frame, dispatch, encode, write.
+
+The payoff is that MiniKV is now a real Redis endpoint. `redis-cli ping` works,
+and so does netcat, because the parser accepts inline commands too.
 
 Run:   python3 -m minikv.server
-Test:  open three clients at once - all three get echoed independently.
+Test:  redis-cli -p 6379 ping            ->  PONG
+       redis-cli -p 6379 echo hello      ->  "hello"
+       printf 'PING\r\n' | nc 127.0.0.1 6379
 """
 
 import socket
 import threading
+
+from minikv import protocol
 
 # --- Configuration -----------------------------------------------------------
 
@@ -28,9 +40,12 @@ HOST = "127.0.0.1"
 PORT = 6379
 
 # Maximum bytes we pull off the kernel's receive buffer in a single read.
-# This is a ceiling, NOT a promise: recv() is allowed to return fewer bytes
-# than we asked for, and it regularly does. Module 3 is where that stops being
-# a curiosity and starts being a bug we have to design around.
+# This is a ceiling, NOT a promise: recv() is allowed to return fewer bytes than
+# we asked for, and it regularly does. As of Module 3 that no longer matters to
+# the code below - whatever arrives goes into the parser, which is the one place
+# that knows what a whole command looks like. The number is now purely a
+# throughput knob: too small and we make extra syscalls, too large and every
+# idle connection holds a buffer it is not using.
 READ_BUFFER_SIZE = 4096
 
 # How many fully-established connections the kernel queues before refusing new
@@ -96,15 +111,148 @@ def _unregister_connection() -> int:
         return _active_connections
 
 
+# --- Commands ----------------------------------------------------------------
+#
+# Added: 2026-09-04 (Module 3)
+#
+# Every handler has the same shape: it receives the arguments *after* the
+# command name, already decoded from RESP into byte strings, and returns the
+# encoded reply. It never touches the socket. That separation is what lets the
+# whole command set be tested without opening a connection, and it is why
+# Module 4 can add GET and SET as two more entries in the table below rather
+# than as two more branches inside the network loop.
+#
+# Handlers return (reply, close_connection). Only QUIT sets the flag, but the
+# alternative - having the network loop re-inspect the command name to notice -
+# would put knowledge of one command back in the transport layer.
+
+
+def _cmd_ping(args: list[bytes]) -> tuple[bytes, bool]:
+    """PING [message] - liveness check, and the traditional first command.
+
+    Added: 2026-09-04 (Module 3)
+
+    With an argument, PING echoes it back as a bulk string instead of replying
+    +PONG. That is not decoration: it is how a client with several requests in
+    flight can put a known token into the stream and find its place again.
+    """
+    if not args:
+        return protocol.PONG, False
+    if len(args) == 1:
+        return protocol.bulk_string(args[0]), False
+    return _wrong_arity("ping"), False
+
+
+def _cmd_echo(args: list[bytes]) -> tuple[bytes, bool]:
+    """ECHO message - send one argument straight back.
+
+    Added: 2026-09-04 (Module 3)
+
+    Module 1's whole server, reduced to a single command. Worth keeping around:
+    it round-trips one argument through the parser and the encoder, so if a
+    binary value survives ECHO the wire format is honest about being binary safe.
+    """
+    if len(args) != 1:
+        return _wrong_arity("echo"), False
+    return protocol.bulk_string(args[0]), False
+
+
+def _cmd_command(args: list[bytes]) -> tuple[bytes, bool]:
+    """COMMAND [...] - introspection, answered with an empty list.
+
+    Added: 2026-09-04 (Module 3)
+
+    redis-cli sends COMMAND DOCS the moment it connects, to build tab
+    completion. Real Redis answers with a description of every command it knows;
+    an empty array is a truthful "I am not telling you", and the client accepts
+    it and carries on. Without this, the very first thing a user tries prints an
+    error before they have typed a command.
+    """
+    return protocol.EMPTY_ARRAY, False
+
+
+def _cmd_quit(args: list[bytes]) -> tuple[bytes, bool]:
+    """QUIT - acknowledge, then hang up.
+
+    Added: 2026-09-04 (Module 3)
+
+    The reply goes out before the close, which is the entire point of the
+    command: the client learns the server got everything it sent, rather than
+    guessing from a socket that just went away.
+    """
+    return protocol.OK, True
+
+
+# The dispatch table. Names are upper case because that is what we normalise to;
+# Redis command names are case-insensitive on the wire.
+COMMANDS = {
+    "PING": _cmd_ping,
+    "ECHO": _cmd_echo,
+    "COMMAND": _cmd_command,
+    "QUIT": _cmd_quit,
+}
+
+
+def _wrong_arity(name: str) -> bytes:
+    """The standard reply for a command called with the wrong argument count.
+
+    Added: 2026-09-04 (Module 3)
+    """
+    return protocol.error(f"ERR wrong number of arguments for '{name}' command")
+
+
+def _quote(raw: bytes) -> str:
+    """Render a client-supplied byte string for inclusion in an error message.
+
+    Added: 2026-09-04 (Module 3)
+
+    These bytes came from the network and are about to go back out inside a
+    simple-string error reply, where an embedded CRLF would truncate the reply
+    and desynchronise the client. So: latin-1 decodes any byte without raising
+    (every byte is a code point), unicode_escape turns the control characters
+    into visible backslash escapes, and the apostrophes get escaped by hand
+    because the message wraps this in quotes. Long arguments are truncated - an
+    error message is not a mirror.
+    """
+    text = raw[:32].decode("latin-1").encode("unicode_escape").decode("ascii")
+    quoted = text.replace("'", "\\'")
+    return quoted + "..." if len(raw) > 32 else quoted
+
+
+def dispatch(command: list[bytes]) -> tuple[bytes, bool]:
+    """Route one parsed command to its handler. Returns (reply, close).
+
+    Added: 2026-09-04 (Module 3)
+
+    The command name is bytes off the wire, so it can be any garbage at all;
+    latin-1 decodes any byte without raising, and upper() normalises the case
+    that clients are free to choose.
+    """
+    name = command[0].decode("latin-1").upper()
+    handler = COMMANDS.get(name)
+
+    if handler is None:
+        # Redis' wording, including the trailing comma - client test suites and
+        # more than one shell script match on this string.
+        args = "".join(f"'{_quote(arg)}', " for arg in command[1:])
+        return protocol.error(
+            f"ERR unknown command '{_quote(command[0])}', "
+            f"with args beginning with: {args}"
+        ), False
+
+    return handler(command[1:])
+
+
 # --- Connection handling -----------------------------------------------------
 
 def handle_client(conn: socket.socket, addr: tuple[str, int]) -> None:
-    """Echo everything one client sends, until that client disconnects.
+    """Read, frame, dispatch and answer one client's commands until they hang up.
 
     Runs on its own thread, one per connection.
 
     Added:   2026-09-04 (Module 1)
     Updated: 2026-09-04 (Module 2 - connection accounting, TCP_NODELAY)
+    Updated: 2026-09-04 (Module 3 - RESP framing instead of echoing)
     """
     connection_id, active = _register_connection()
     peer = f"{addr[0]}:{addr[1]}"
@@ -122,6 +270,11 @@ def handle_client(conn: socket.socket, addr: tuple[str, int]) -> None:
             # never come. This one line is worth real latency in Module 10.
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
+            # One parser per connection, because the half-command it may be
+            # holding belongs to this connection and no other. This is also the
+            # only per-client state in the server - so far.
+            parser = protocol.RESPParser()
+
             while True:
                 # Blocking call. Only THIS thread sleeps here now - the accept
                 # loop and every other client thread keep running.
@@ -134,10 +287,42 @@ def handle_client(conn: socket.socket, addr: tuple[str, int]) -> None:
                 if not data:
                     break
 
-                # sendall() keeps looping until every byte has been handed to
-                # the kernel. Plain send() may accept only part of the buffer
-                # and return the count, silently dropping the rest.
-                conn.sendall(data)
+                parser.feed(data)
+
+                # Collect this batch's replies rather than writing each one as
+                # we go. A pipelining client can send fifty commands in a single
+                # packet, and with TCP_NODELAY set every individual sendall()
+                # would be its own segment on the wire - fifty syscalls and
+                # fifty packets to answer one read.
+                replies: list[bytes] = []
+                closing = False
+
+                try:
+                    for command in parser.commands():
+                        reply, close_after = dispatch(command)
+                        replies.append(reply)
+                        if close_after:
+                            closing = True
+                            # Anything the client pipelined behind QUIT is
+                            # deliberately dropped: they told us they were done.
+                            break
+
+                except protocol.ProtocolError as exc:
+                    # The framing is broken, so every byte after this point is
+                    # untrustworthy - there is no resynchronisation point in a
+                    # length-prefixed stream. Say why, then hang up.
+                    log(f"[server] #{connection_id} protocol error: {exc}")
+                    replies.append(protocol.error(f"ERR Protocol error: {exc}"))
+                    closing = True
+
+                if replies:
+                    # sendall() keeps looping until every byte has been handed
+                    # to the kernel. Plain send() may accept only part of the
+                    # buffer and return the count, silently dropping the rest.
+                    conn.sendall(b"".join(replies))
+
+                if closing:
+                    break
 
     except OSError as exc:
         # A client that is killed rather than closed cleanly (Ctrl-C in netcat,
